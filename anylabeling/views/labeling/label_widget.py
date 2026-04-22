@@ -1442,6 +1442,13 @@ class LabelingWidget(LabelDialog):
             icon=upload_export_icon,
             tip=self.tr("Upload Custom MM-Grounding-DINO Annotations"),
         )
+        upload_crnn_annotation = action(
+            self.tr("CRNN"),
+            lambda: utils.upload_crnn_annotation(self),
+            None,
+            icon=upload_export_icon,
+            tip=self.tr("Upload CRNN labels.txt Annotations"),
+        )
         upload_ppocr_rec_annotation = action(
             self.tr("PPOCR Rec"),
             lambda: utils.upload_ppocr_annotation(self, "rec"),
@@ -1590,6 +1597,13 @@ class LabelingWidget(LabelDialog):
             tip=self.tr(
                 "Export Custom PPOCR Key Information Extraction (KIE - Semantic Entity Recognition & Relation Extraction) Annotations"
             ),
+        )
+        export_crnn_annotation = action(
+            self.tr("CRNN"),
+            lambda: utils.export_crnn_annotation(self),
+            None,
+            icon=upload_export_icon,
+            tip=self.tr("Export CRNN labels.txt Annotations"),
         )
         export_vlm_r1_ovd_annotation = action(
             self.tr("VLM-R1 OVD"),
@@ -1741,6 +1755,7 @@ class LabelingWidget(LabelDialog):
             upload_mot_annotation=upload_mot_annotation,
             upload_odvg_annotation=upload_odvg_annotation,
             upload_mmgd_annotation=upload_mmgd_annotation,
+            upload_crnn_annotation=upload_crnn_annotation,
             upload_ppocr_rec_annotation=upload_ppocr_rec_annotation,
             upload_ppocr_kie_annotation=upload_ppocr_kie_annotation,
             upload_vlm_r1_ovd_annotation=upload_vlm_r1_ovd_annotation,
@@ -1760,6 +1775,7 @@ class LabelingWidget(LabelDialog):
             export_odvg_annotation=export_odvg_annotation,
             export_pporc_rec_annotation=export_pporc_rec_annotation,
             export_pporc_kie_annotation=export_pporc_kie_annotation,
+            export_crnn_annotation=export_crnn_annotation,
             export_vlm_r1_ovd_annotation=export_vlm_r1_ovd_annotation,
             zoom=zoom,
             zoom_in=zoom_in,
@@ -2020,6 +2036,7 @@ class LabelingWidget(LabelDialog):
                 upload_odvg_annotation,
                 upload_mmgd_annotation,
                 None,
+                upload_crnn_annotation,
                 upload_ppocr_rec_annotation,
                 upload_ppocr_kie_annotation,
                 None,
@@ -2050,6 +2067,7 @@ class LabelingWidget(LabelDialog):
                 None,
                 export_pporc_rec_annotation,
                 export_pporc_kie_annotation,
+                export_crnn_annotation,
                 None,
                 export_vlm_r1_ovd_annotation,
             ),

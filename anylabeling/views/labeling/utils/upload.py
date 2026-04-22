@@ -49,6 +49,29 @@ class UploadPPOCRThread(QThread):
             self.finished.emit(False, str(e))
 
 
+class UploadCRNNThread(QThread):
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, converter, input_file, output_path, image_path):
+        super().__init__()
+        self.converter = converter
+        self.input_file = input_file
+        self.output_path = output_path
+        self.image_path = image_path
+
+    def run(self):
+        try:
+            time.sleep(1)
+            self.converter.crnn_to_custom(
+                input_file=self.input_file,
+                output_path=self.output_path,
+                image_path=self.image_path,
+            )
+            self.finished.emit(True, "")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+
 class UploadOdvgThread(QThread):
     finished = pyqtSignal(bool, str)
 
@@ -323,6 +346,92 @@ def upload_ppocr_annotation(self, mode):
     progress_dialog.show()
     self.upload_thread.start()
 
+    progress_dialog.canceled.connect(self.upload_thread.terminate)
+
+
+def upload_crnn_annotation(self):
+    if not _check_filename_exist(self):
+        return
+
+    filter = "Attribute Files (*.txt);;All Files (*)"
+    input_file, _ = QtWidgets.QFileDialog.getOpenFileName(
+        self,
+        self.tr("Select a CRNN labels file (labels.txt)"),
+        "",
+        filter,
+    )
+    if not input_file:
+        return
+
+    default_image_root = osp.dirname(self.filename)
+    image_root = QtWidgets.QFileDialog.getExistingDirectory(
+        self,
+        self.tr("Select image root directory used by labels.txt"),
+        default_image_root,
+        QtWidgets.QFileDialog.Option.ShowDirsOnly
+        | QtWidgets.QFileDialog.Option.DontResolveSymlinks,
+    )
+    if not image_root:
+        return
+
+    response = QtWidgets.QMessageBox()
+    response.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+    response.setWindowTitle(self.tr("Warning"))
+    response.setText(self.tr("Current annotation will be lost"))
+    response.setInformativeText(
+        self.tr(
+            "You are going to upload new annotations to this task. Continue?"
+        )
+    )
+    response.setStandardButtons(
+        QtWidgets.QMessageBox.StandardButton.Cancel
+        | QtWidgets.QMessageBox.StandardButton.Ok
+    )
+    response.setStyleSheet(get_msg_box_style())
+    if response.exec() != QtWidgets.QMessageBox.StandardButton.Ok:
+        return
+
+    progress_dialog = QProgressDialog(
+        self.tr("Uploading..."), self.tr("Cancel"), 0, 0, self
+    )
+    progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+    progress_dialog.setWindowTitle(self.tr("Progress"))
+    progress_dialog.setMinimumWidth(500)
+    progress_dialog.setMinimumHeight(150)
+    progress_dialog.setRange(0, 0)
+    progress_dialog.setStyleSheet(get_progress_dialog_style())
+
+    converter = LabelConverter()
+    output_path = self.output_dir if self.output_dir else image_root
+    self.upload_thread = UploadCRNNThread(
+        converter, input_file, output_path, image_root
+    )
+
+    def on_upload_finished(success, error_msg):
+        progress_dialog.close()
+        if success:
+            self.load_file(self.filename)
+            popup = Popup(
+                self.tr("Uploading annotations successfully!"),
+                self,
+                icon=new_icon_path("copy-green", "svg"),
+            )
+            popup.show_popup(self, popup_height=65, position="center")
+        else:
+            message = (
+                f"Error occurred while uploading annotations: {str(error_msg)}"
+            )
+            logger.error(message)
+            popup = Popup(
+                message,
+                self,
+                icon=new_icon_path("error", "svg"),
+            )
+            popup.show_popup(self, position="center")
+
+    self.upload_thread.finished.connect(on_upload_finished)
+    progress_dialog.show()
+    self.upload_thread.start()
     progress_dialog.canceled.connect(self.upload_thread.terminate)
 
 

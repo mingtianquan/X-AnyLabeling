@@ -1381,6 +1381,169 @@ def export_pporc_annotation(self, mode):
         popup.show_popup(self, position="center")
 
 
+def export_crnn_annotation(self):
+    if not _check_filename_exist(self):
+        return
+
+    dialog = QtWidgets.QDialog(self)
+    dialog.setWindowTitle(self.tr("Export CRNN Labels"))
+    dialog.setMinimumWidth(520)
+    dialog.setStyleSheet(get_export_option_style())
+
+    layout = QVBoxLayout()
+    layout.setContentsMargins(24, 24, 24, 24)
+    layout.setSpacing(16)
+
+    label_dir_path = osp.dirname(self.filename)
+    if self.output_dir:
+        label_dir_path = self.output_dir
+    default_file = osp.realpath(
+        osp.join(label_dir_path, "..", "crnn_labels.txt")
+    )
+
+    path_layout = QVBoxLayout()
+    path_label = QtWidgets.QLabel(self.tr("Labels file"))
+    path_layout.addWidget(path_label)
+    path_input_layout = QHBoxLayout()
+    path_edit = QtWidgets.QLineEdit(default_file)
+    path_edit.setPlaceholderText(self.tr("Select labels.txt output file"))
+
+    def browse_export_file():
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            dialog,
+            self.tr("Select labels.txt output file"),
+            path_edit.text(),
+            "Text Files (*.txt);;All Files (*)",
+            options=QtWidgets.QFileDialog.Option.DontUseNativeDialog,
+        )
+        if path:
+            if not path.lower().endswith(".txt"):
+                path += ".txt"
+            path_edit.setText(path)
+
+    path_button = QtWidgets.QPushButton(self.tr("Browse"))
+    path_button.clicked.connect(browse_export_file)
+    path_button.setStyleSheet(get_cancel_btn_style())
+    path_input_layout.addWidget(path_edit)
+    path_input_layout.addWidget(path_button)
+    path_layout.addLayout(path_input_layout)
+    layout.addLayout(path_layout)
+
+    split_layout = QVBoxLayout()
+    split_label = QtWidgets.QLabel(self.tr("Filename split char"))
+    split_layout.addWidget(split_label)
+    split_char_edit = QtWidgets.QLineEdit("_")
+    split_char_edit.setPlaceholderText(
+        self.tr("Used when fallback to filename, e.g. _")
+    )
+    split_layout.addWidget(split_char_edit)
+    layout.addLayout(split_layout)
+
+    fallback_checkbox = QtWidgets.QCheckBox(
+        self.tr("Fallback to filename prefix if annotation is empty")
+    )
+    fallback_checkbox.setChecked(True)
+    layout.addWidget(fallback_checkbox)
+
+    button_layout = QHBoxLayout()
+    cancel_button = QtWidgets.QPushButton(self.tr("Cancel"))
+    cancel_button.clicked.connect(dialog.reject)
+    cancel_button.setStyleSheet(get_cancel_btn_style())
+    ok_button = QtWidgets.QPushButton(self.tr("OK"))
+    ok_button.clicked.connect(dialog.accept)
+    ok_button.setStyleSheet(get_ok_btn_style())
+    button_layout.addStretch()
+    button_layout.addWidget(cancel_button)
+    button_layout.addWidget(ok_button)
+    layout.addLayout(button_layout)
+    dialog.setLayout(layout)
+
+    if not dialog.exec():
+        return
+
+    save_file = path_edit.text().strip()
+    if not save_file:
+        return
+
+    if osp.exists(save_file):
+        response = QtWidgets.QMessageBox.question(
+            self,
+            self.tr("Output File Exists"),
+            self.tr("labels.txt already exists. Overwrite it?"),
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if response != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+    split_char = split_char_edit.text() or "_"
+    fallback_from_filename = fallback_checkbox.isChecked()
+    converter = LabelConverter()
+
+    image_list = self.image_list if self.image_list else [self.filename]
+    base_dir = osp.commonpath([osp.dirname(x) for x in image_list])
+    lines = []
+    progress_dialog = QProgressDialog(
+        self.tr("Exporting..."), self.tr("Cancel"), 0, len(image_list), self
+    )
+    progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+    progress_dialog.setWindowTitle(self.tr("Progress"))
+    progress_dialog.setMinimumWidth(500)
+    progress_dialog.setMinimumHeight(150)
+    progress_dialog.setStyleSheet(
+        get_progress_dialog_style(color="#1d1d1f", height=20)
+    )
+
+    try:
+        for i, image_file in enumerate(image_list):
+            image_name = osp.basename(image_file)
+            label_file = osp.join(
+                osp.dirname(image_file),
+                osp.splitext(image_name)[0] + ".json",
+            )
+            label_text = converter.custom_to_crnn(
+                image_file=image_file,
+                label_file=label_file,
+                split_char=split_char,
+                fallback_from_filename=fallback_from_filename,
+            )
+            if label_text:
+                rel_path = osp.relpath(image_file, base_dir).replace("\\", "/")
+                lines.append(f"{rel_path}\t{label_text}")
+
+            progress_dialog.setValue(i)
+            if progress_dialog.wasCanceled():
+                break
+
+        pathlib.Path(save_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(save_file, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
+        progress_dialog.close()
+
+        message_text = self.tr(
+            "Exporting annotations successfully!\nResults have been saved to:\n%s"
+        ) % save_file
+        popup = Popup(
+            message_text,
+            self,
+            icon=new_icon_path("copy-green", "svg"),
+        )
+        popup.show_popup(self, popup_height=65, position="center")
+
+    except Exception as e:
+        message = f"Error occurred while exporting annotations: {str(e)}"
+        progress_dialog.close()
+        logger.error(message)
+        popup = Popup(
+            message,
+            self,
+            icon=new_icon_path("error", "svg"),
+        )
+        popup.show_popup(self, position="center")
+
+
 def export_vlm_r1_ovd_annotation(self):
     if not _check_filename_exist(self):
         return

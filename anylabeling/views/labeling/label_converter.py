@@ -2222,3 +2222,108 @@ class LabelConverter:
                 with open(ppocr_kie_file, "a", encoding="utf-8") as f:
                     f.write(item)
             return class_set
+
+    @staticmethod
+    def extract_crnn_label_from_filename(
+        image_file: str, split_char: str = "_"
+    ) -> str:
+        stem = pathlib.Path(image_file).stem
+        if split_char not in stem:
+            return ""
+        return stem.split(split_char, 1)[0].strip()
+
+    def crnn_to_custom(self, input_file, output_path, image_path):
+        """
+        Convert CRNN labels.txt format to X-AnyLabeling json labels.
+
+        labels.txt format:
+            relative/or/absolute/image/path <TAB|SPACE> text_label
+        """
+        with open(input_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        for line in lines:
+            row = line.strip()
+            if not row:
+                continue
+
+            if "\t" in row:
+                image_rel_path, transcription = row.split("\t", 1)
+            else:
+                parts = row.rsplit(maxsplit=1)
+                if len(parts) != 2:
+                    continue
+                image_rel_path, transcription = parts[0], parts[1]
+
+            image_rel_path = image_rel_path.strip().replace("\\", "/")
+            transcription = transcription.strip()
+            if not image_rel_path:
+                continue
+
+            image_file = image_rel_path
+            if not osp.isabs(image_file):
+                image_file = osp.join(image_path, image_rel_path)
+
+            if not osp.exists(image_file):
+                logger.warning(
+                    f"Skipping missing image while importing CRNN labels: {image_file}"
+                )
+                continue
+
+            image_width, image_height = self.get_image_size(image_file)
+            self.reset()
+            self.custom_data["imageHeight"] = image_height
+            self.custom_data["imageWidth"] = image_width
+            self.custom_data["imagePath"] = osp.basename(image_file)
+            self.custom_data["description"] = transcription
+
+            rel_dir = osp.dirname(image_rel_path)
+            output_dir = (
+                osp.join(output_path, rel_dir) if rel_dir else output_path
+            )
+            os.makedirs(output_dir, exist_ok=True)
+            output_file = osp.join(
+                output_dir,
+                osp.splitext(osp.basename(image_file))[0] + ".json",
+            )
+            self.save_json(self.custom_data, output_file)
+
+    def custom_to_crnn(
+        self,
+        image_file,
+        label_file,
+        split_char="_",
+        fallback_from_filename=False,
+    ):
+        """
+        Extract one CRNN text label from X-AnyLabeling json.
+
+        Priority:
+        1. image-level `description`
+        2. first non-empty shape `description`
+        3. filename prefix (optional)
+        """
+        label_text = ""
+        if osp.exists(label_file):
+            try:
+                data = self.read_json(label_file)
+            except Exception as e:
+                logger.warning(f"Failed to read json label file: {e}")
+                data = {}
+
+            label_text = str(data.get("description", "") or "").strip()
+            if not label_text:
+                for shape in data.get("shapes", []):
+                    description = str(
+                        shape.get("description", "") or ""
+                    ).strip()
+                    if description:
+                        label_text = description
+                        break
+
+        if not label_text and fallback_from_filename:
+            label_text = self.extract_crnn_label_from_filename(
+                image_file=image_file, split_char=split_char
+            )
+
+        return label_text
