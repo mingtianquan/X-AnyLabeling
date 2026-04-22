@@ -339,6 +339,30 @@ class UltralyticsDialog(QDialog):
         self._detection_cache = None
 
     def closeEvent(self, event):
+        if self.training_status == "training":
+            QMessageBox.warning(
+                self,
+                self.tr("Training in Progress"),
+                self.tr(
+                    "Cannot close window while training is in progress. Please stop training first."
+                ),
+            )
+            event.ignore()
+            return
+
+        try:
+            if (
+                hasattr(self, "export_manager")
+                and self.export_manager
+                and self.export_manager.is_exporting
+            ):
+                self.export_manager.stop_export()
+        except Exception:
+            pass
+
+        if self.training_status in ["completed", "error", "stop"]:
+            self.save_training_logs_to_file()
+
         self.clear_cache()
         super().closeEvent(event)
 
@@ -557,6 +581,7 @@ class UltralyticsDialog(QDialog):
         device_layout = QHBoxLayout()
         self.config_widgets["device"] = CustomComboBox()
         self.config_widgets["device"].addItems(DEVICE_OPTIONS)
+        self.config_widgets["device"].setCurrentText("cpu")
         self.device_checkboxes = QWidget()
         self.device_checkboxes.setVisible(False)
         self.config_widgets["device"].currentTextChanged.connect(
@@ -1212,7 +1237,9 @@ class UltralyticsDialog(QDialog):
             return
 
         config = self.get_current_config()
-        is_valid, error_message = validate_basic_config(config)
+        is_valid, error_message = validate_basic_config(
+            config, self.selected_task_type
+        )
         if is_valid == "directory_exists":
             project_dir = error_message
             potential_model_path = os.path.join(
@@ -1731,8 +1758,47 @@ class UltralyticsDialog(QDialog):
             else:
                 self.append_training_log(self.tr("Cancel to stop training"))
 
+    def _build_auto_data_yaml(self) -> str:
+        if self.selected_task_type in [None, "Classify"]:
+            return ""
+
+        valid_shapes = TASK_SHAPE_MAPPINGS.get(self.selected_task_type, [])
+        label_infos = get_label_infos(
+            self.image_list, valid_shapes, self.output_dir
+        )
+        class_names = sorted(label_infos.keys())
+
+        if not class_names:
+            raise ValueError(
+                "Data is empty and no labeled classes were found to auto-generate data.yaml"
+            )
+
+        auto_data = {
+            "names": {i: name for i, name in enumerate(class_names)},
+            "nc": len(class_names),
+        }
+        auto_data_path = os.path.join(get_trainer_root_dir(), "auto_data.yaml")
+        os.makedirs(os.path.dirname(auto_data_path), exist_ok=True)
+
+        if not save_yaml_config(auto_data, auto_data_path):
+            raise RuntimeError(
+                f"Failed to save auto-generated data file: {auto_data_path}"
+            )
+
+        self.names = class_names
+        self.config_widgets["data"].setText(auto_data_path)
+        self.append_training_log(
+            f"Auto-generated data.yaml: {auto_data_path} (classes: {len(class_names)})"
+        )
+        return auto_data_path
+
     def get_training_args(self, config):
         try:
+            data_file = config["basic"].get("data", "").strip()
+            if self.selected_task_type != "Classify" and not data_file:
+                data_file = self._build_auto_data_yaml()
+                config["basic"]["data"] = data_file
+
             if self.selected_task_type == "Classify" and os.path.isdir(
                 config["basic"]["data"]
             ):
@@ -1745,7 +1811,7 @@ class UltralyticsDialog(QDialog):
                     self.image_list,
                     self.selected_task_type,
                     config["basic"]["dataset_ratio"],
-                    config["basic"]["data"],
+                    data_file,
                     self.output_dir,
                     config["basic"].get("pose_config"),
                     config["checkpoint"].get("skip_empty_files", False),
@@ -1762,7 +1828,9 @@ class UltralyticsDialog(QDialog):
             device_value = config["basic"]["device"]
             if device_value == "cuda" and hasattr(self, "device_checkboxes"):
                 selected_gpus = []
+                has_cuda_selector = False
                 if hasattr(self, "_cuda_layout") and self._cuda_layout:
+                    has_cuda_selector = self._cuda_layout.count() > 0
                     for i in range(self._cuda_layout.count()):
                         widget = self._cuda_layout.itemAt(i).widget()
                         if (
@@ -1773,7 +1841,10 @@ class UltralyticsDialog(QDialog):
                             gpu_text = widget.text()
                             gpu_id = gpu_text.split()[-1]
                             selected_gpus.append(int(gpu_id))
-                device_value = selected_gpus if selected_gpus else "cpu"
+                if has_cuda_selector:
+                    device_value = selected_gpus if selected_gpus else "cpu"
+                else:
+                    device_value = 0
 
             train_args = {
                 "data": data_path,
@@ -1828,6 +1899,7 @@ class UltralyticsDialog(QDialog):
         self.current_project_path = os.path.join(project_path, name)
 
         try:
+            self.start_training_button.setEnabled(False)
             self.append_training_log(self.tr("Preparing training..."))
             train_args = self.get_training_args(config)
             success, message = self.training_manager.start_training(train_args)
@@ -1836,12 +1908,14 @@ class UltralyticsDialog(QDialog):
                     f"Failed to start training: {message}"
                 )
                 QMessageBox.critical(self, self.tr("Training Error"), message)
+                self.start_training_button.setEnabled(True)
                 return
 
         except Exception as e:
             error_msg = f"Failed to start training: {str(e)}"
             self.append_training_log(f"ERROR: {error_msg}")
             QMessageBox.critical(self, self.tr("Training Error"), error_msg)
+            self.start_training_button.setEnabled(True)
 
     def init_training_actions(self, parent_layout):
         actions_layout = QHBoxLayout()

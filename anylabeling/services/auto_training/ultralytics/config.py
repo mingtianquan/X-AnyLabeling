@@ -1,13 +1,26 @@
 import os
 import multiprocessing
+import sys
 
 from anylabeling.config import get_work_directory
 
 
 def get_trainer_root_dir():
+    base_dir = _get_trainer_base_dir()
     return os.path.join(
-        get_work_directory(), "xanylabeling_data", "trainer", "ultralytics"
+        base_dir, "xanylabeling_data", "trainer", "ultralytics"
     )
+
+
+def _get_trainer_base_dir():
+    env_dir = os.environ.get("XANYLABELING_TRAINER_BASE_DIR", "").strip()
+    if env_dir:
+        return os.path.abspath(os.path.expanduser(env_dir))
+
+    if getattr(sys, "frozen", False) and getattr(sys, "executable", ""):
+        return os.path.dirname(os.path.abspath(sys.executable))
+
+    return get_work_directory()
 
 
 def get_data_path():
@@ -155,7 +168,7 @@ IS_TORCH_AVAILABLE = is_torch_available()
 IS_CUDA_AVAILABLE = is_cuda_available()
 IS_MPS_AVAILABLE = is_mps_available()
 DEVICE_OPTIONS = (
-    (["cuda"] if IS_CUDA_AVAILABLE else [])
+    ["cuda"]
     + (["mps"] if IS_MPS_AVAILABLE else [])
     + ["cpu"]
 )

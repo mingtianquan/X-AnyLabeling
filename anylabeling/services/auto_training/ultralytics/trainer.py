@@ -10,6 +10,7 @@ from typing import Dict, Tuple
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from .config import get_settings_config_path
+from .runtime_env import ensure_ultralytics_runtime
 
 
 class TrainingEventRedirector(QObject):
@@ -59,15 +60,23 @@ class TrainingManager:
             except Exception:
                 pass
 
+    def _emit_training_log(self, message: str):
+        self.notify_callbacks("training_log", {"message": message})
+
+    @staticmethod
+    def _resolve_torch_backend_from_device(device_value) -> str:
+        if isinstance(device_value, str) and device_value.lower() == "cpu":
+            return "cpu"
+        return "auto"
+
     def start_training(self, train_args: Dict) -> Tuple[bool, str]:
         if self.is_training:
             return False, "Training is already in progress"
 
         try:
-            import sys
-
             self.total_epochs = train_args.get("epochs", 100)
             self.stop_event.clear()
+            self.is_training = True
 
             script_content = f"""# -*- coding: utf-8 -*-
 import io
@@ -121,13 +130,32 @@ if __name__ == "__main__":
 
             def run_training():
                 try:
-                    self.is_training = True
+                    torch_backend = self._resolve_torch_backend_from_device(
+                        train_args.get("device")
+                    )
+                    runtime_ok, runtime_message, runtime_python = (
+                        ensure_ultralytics_runtime(
+                            log_callback=self._emit_training_log,
+                            torch_backend=torch_backend,
+                        )
+                    )
+                    if not runtime_ok:
+                        self.is_training = False
+                        self.notify_callbacks(
+                            "training_error", {"error": runtime_message}
+                        )
+                        return
+                    if self.stop_event.is_set():
+                        self.is_training = False
+                        self.notify_callbacks("training_stopped", {})
+                        return
+
                     self.notify_callbacks(
                         "training_started", {"total_epochs": self.total_epochs}
                     )
 
                     self.training_process = subprocess.Popen(
-                        [sys.executable, script_path],
+                        [runtime_python, script_path],
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         text=True,
@@ -212,12 +240,8 @@ if __name__ == "__main__":
 
             return True, "Training started successfully"
 
-        except ImportError:
-            return (
-                False,
-                "Ultralytics is not installed. Please install it with: pip install ultralytics",
-            )
         except Exception as e:
+            self.is_training = False
             return False, f"Failed to start training: {str(e)}"
 
     def stop_training(self) -> bool:

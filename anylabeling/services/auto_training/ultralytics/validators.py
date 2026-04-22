@@ -2,13 +2,15 @@ import os
 import subprocess
 import sys
 import yaml
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from .utils import get_task_valid_images
 from .config import MIN_LABELED_IMAGES_THRESHOLD
 
 
-def validate_basic_config(config: Dict) -> Tuple[Union[bool, str], str]:
+def validate_basic_config(
+    config: Dict, task_type: Optional[str] = None
+) -> Tuple[Union[bool, str], str]:
     """Validate basic training configuration
 
     Args:
@@ -37,7 +39,9 @@ def validate_basic_config(config: Dict) -> Tuple[Union[bool, str], str]:
         return False, "Valid model file is required"
 
     data_path = basic.get("data", "").strip()
-    if not data_path or not os.path.exists(data_path):
+    if data_path and not os.path.exists(data_path):
+        if task_type == "Classify":
+            return False, "Valid data directory is required"
         return False, "Valid data file is required"
 
     return True, ""

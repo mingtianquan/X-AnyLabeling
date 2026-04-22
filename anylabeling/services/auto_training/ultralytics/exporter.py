@@ -1,14 +1,16 @@
 import os
-import sys
+import json
+import tempfile
+import subprocess
 import threading
 from io import StringIO
-from typing import Tuple
+from typing import Dict, List, Tuple
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
 
-from .utils import check_package_installed
-from .validators import install_packages_with_timeout
+from .runtime_env import ensure_ultralytics_runtime
+from .custom_ncnn_export import run_custom_ncnn_export
 
 
 class ExportEventRedirector(QObject):
@@ -43,167 +45,24 @@ class ExportLogRedirector(QObject):
         pass
 
 
-def validate_onnx_export_environment():
-    required_packages = ["onnx", "onnxslim", "onnxruntime"]
-    missing_packages = []
-    package_mapping = {
-        "onnx": "onnx>=1.12.0,<1.18.0",
-        "onnxslim": "onnxslim>=0.1.59",
-        "onnxruntime": "onnxruntime",
-    }
+EXPORT_RESULT_PREFIX = "XANYLABELING_EXPORT_RESULT="
 
-    for package in required_packages:
-        if not check_package_installed(package):
-            missing_packages.append(package_mapping[package])
-
-    try:
-        import onnx
-
-        if hasattr(onnx, "__version__"):
-            onnx_version = onnx.__version__
-            from packaging import version
-
-            if version.parse(onnx_version) >= version.parse("1.18.0"):
-                missing_packages.append("onnx>=1.12.0,<1.18.0")
-    except:
-        pass
-
-    return missing_packages
-
-
-def validate_openvino_export_environment():
-    required_packages = ["openvino"]
-    missing_packages = []
-    package_mapping = {"openvino": "openvino>=2024.0.0"}
-
-    for package in required_packages:
-        if not check_package_installed(package):
-            missing_packages.append(package_mapping[package])
-
-    return missing_packages
-
-
-def validate_tensorrt_export_environment():
-    required_packages = ["tensorrt"]
-    missing_packages = []
-    package_mapping = {"tensorrt": "tensorrt>7.0.0,!=10.1.0"}
-
-    for package in required_packages:
-        if not check_package_installed(package):
-            missing_packages.append(package_mapping[package])
-
-    return missing_packages
-
-
-def validate_coreml_export_environment():
-    required_packages = ["coremltools"]
-    missing_packages = []
-    package_mapping = {"coremltools": "coremltools>=8.0"}
-
-    for package in required_packages:
-        if not check_package_installed(package):
-            missing_packages.append(package_mapping[package])
-
-    return missing_packages
-
-
-def validate_tensorflow_export_environment():
-    required_packages = ["tensorflow"]
-    missing_packages = []
-    package_mapping = {"tensorflow": "tensorflow>=2.0.0"}
-
-    for package in required_packages:
-        if not check_package_installed(package):
-            missing_packages.append(package_mapping[package])
-
-    return missing_packages
-
-
-def validate_paddle_export_environment():
-    required_packages = ["paddlepaddle", "x2paddle"]
-    missing_packages = []
-    package_mapping = {
-        "paddlepaddle": "paddlepaddle-gpu",
-        "x2paddle": "x2paddle",
-    }
-
-    for package in required_packages:
-        if not check_package_installed(package):
-            missing_packages.append(package_mapping[package])
-
-    return missing_packages
-
-
-def validate_mnn_export_environment():
-    required_packages = ["MNN"]
-    missing_packages = []
-    package_mapping = {"MNN": "MNN>=2.9.6"}
-
-    for package in required_packages:
-        if not check_package_installed(package):
-            missing_packages.append(package_mapping[package])
-
-    return missing_packages
-
-
-def validate_ncnn_export_environment():
-    required_packages = ["ncnn"]
-    missing_packages = []
-    package_mapping = {"ncnn": "ncnn"}
-
-    for package in required_packages:
-        if not check_package_installed(package):
-            missing_packages.append(package_mapping[package])
-
-    return missing_packages
-
-
-def validate_imx500_export_environment():
-    required_packages = ["imx500-converter", "mct-quantizers"]
-    missing_packages = []
-    package_mapping = {
-        "imx500-converter": "imx500-converter[pt]>=3.16.1",
-        "mct-quantizers": "mct-quantizers>=1.6.0",
-    }
-
-    for package in required_packages:
-        if not check_package_installed(package):
-            missing_packages.append(package_mapping[package])
-
-    return missing_packages
-
-
-def validate_rknn_export_environment():
-    required_packages = ["rknn-toolkit2"]
-    missing_packages = []
-    package_mapping = {"rknn-toolkit2": "rknn-toolkit2"}
-
-    for package in required_packages:
-        if not check_package_installed(package):
-            missing_packages.append(package_mapping[package])
-
-    return missing_packages
-
-
-def get_export_validator(export_format):
-    validators = {
-        "onnx": validate_onnx_export_environment,
-        "openvino": validate_openvino_export_environment,
-        "engine": validate_tensorrt_export_environment,
-        "coreml": validate_coreml_export_environment,
-        "saved_model": validate_tensorflow_export_environment,
-        "pb": validate_tensorflow_export_environment,
-        "tflite": validate_tensorflow_export_environment,
-        "edgetpu": validate_tensorflow_export_environment,
-        "tfjs": validate_tensorflow_export_environment,
-        "paddle": validate_paddle_export_environment,
-        "mnn": validate_mnn_export_environment,
-        "ncnn": validate_ncnn_export_environment,
-        "imx": validate_imx500_export_environment,
-        "rknn": validate_rknn_export_environment,
-        "torchscript": lambda: [],
-    }
-    return validators.get(export_format, lambda: [])
+EXPORT_RUNTIME_PACKAGES: Dict[str, List[str]] = {
+    "onnx": ["onnx>=1.12.0,<1.18.0", "onnxslim>=0.1.59", "onnxruntime"],
+    "openvino": ["openvino>=2024.0.0"],
+    "engine": ["tensorrt>7.0.0,!=10.1.0"],
+    "coreml": ["coremltools>=8.0"],
+    "saved_model": ["tensorflow>=2.0.0"],
+    "pb": ["tensorflow>=2.0.0"],
+    "tflite": ["tensorflow>=2.0.0"],
+    "edgetpu": ["tensorflow>=2.0.0"],
+    "tfjs": ["tensorflow>=2.0.0"],
+    "paddle": ["paddlepaddle-gpu", "x2paddle"],
+    "mnn": ["MNN>=2.9.6"],
+    "ncnn": ["ncnn", "pnnx"],
+    "imx": ["imx500-converter[pt]>=3.16.1", "mct-quantizers>=1.6.0"],
+    "rknn": ["rknn-toolkit2"],
+}
 
 
 class ExportManager:
@@ -219,9 +78,129 @@ class ExportManager:
             except Exception as e:
                 print(f"Error in export callback: {e}")
 
+    def _emit_export_log(self, message: str):
+        self.notify_callbacks("export_log", {"message": message})
+
+    def _run_export_subprocess(
+        self, runtime_python: str, weights_path: str, export_format: str
+    ) -> Tuple[bool, str]:
+        script_content = f"""# -*- coding: utf-8 -*-
+import io
+import json
+import os
+import sys
+
+if sys.platform.startswith("win"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+from ultralytics import YOLO
+
+RESULT_PREFIX = {repr(EXPORT_RESULT_PREFIX)}
+weights_path = {repr(weights_path)}
+export_format = {repr(export_format)}
+
+try:
+    model = YOLO(weights_path)
+    results = model.export(format=export_format)
+    exported_path = results if isinstance(results, str) else str(results)
+    print(RESULT_PREFIX + json.dumps({{"ok": True, "exported_path": exported_path}}, ensure_ascii=True), flush=True)
+except Exception as e:
+    print(RESULT_PREFIX + json.dumps({{"ok": False, "error": str(e)}}, ensure_ascii=True), flush=True)
+    raise
+"""
+
+        script_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix="_export_script.py",
+                delete=False,
+                encoding="utf-8",
+            ) as f:
+                f.write(script_content)
+                script_path = f.name
+
+            self._emit_export_log(
+                f"Starting export subprocess with runtime: {runtime_python}"
+            )
+            process = subprocess.Popen(
+                [runtime_python, script_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+
+            payload = None
+            assert process.stdout is not None
+            for line in process.stdout:
+                cleaned = line.rstrip()
+                if not cleaned:
+                    continue
+                if cleaned.startswith(EXPORT_RESULT_PREFIX):
+                    raw_json = cleaned[len(EXPORT_RESULT_PREFIX) :]
+                    try:
+                        payload = json.loads(raw_json)
+                    except json.JSONDecodeError:
+                        pass
+                    continue
+                self._emit_export_log(cleaned)
+
+            return_code = process.wait()
+            if payload is None:
+                return (
+                    False,
+                    f"Export subprocess exited with code {return_code} without a result payload.",
+                )
+            if not payload.get("ok"):
+                return False, payload.get("error", "Export failed")
+            return True, str(payload.get("exported_path", ""))
+        except Exception as e:
+            return False, str(e)
+        finally:
+            if script_path:
+                try:
+                    os.remove(script_path)
+                except Exception:
+                    pass
+
+    def _resolve_exported_path(
+        self, weights_path: str, export_format: str, exported_path: str
+    ) -> str:
+        weights_dir = os.path.dirname(weights_path)
+        model_name = os.path.splitext(os.path.basename(weights_path))[0]
+        candidates = []
+
+        if exported_path:
+            candidates.append(exported_path)
+            if not os.path.isabs(exported_path):
+                candidates.append(os.path.join(weights_dir, exported_path))
+
+        candidates.append(weights_path.replace(".pt", f".{export_format}"))
+        if export_format == "ncnn":
+            candidates.append(os.path.join(weights_dir, f"{model_name}_ncnn_model"))
+
+        for path in candidates:
+            if path and os.path.exists(path):
+                return path
+        return exported_path
+
     def start_export(
         self, project_path: str, export_format: str = "onnx"
     ) -> Tuple[bool, str]:
+        if self.is_exporting:
+            if self.export_thread and self.export_thread.is_alive():
+                return False, "Export already in progress"
+            # Recover stale exporting state when thread is no longer running.
+            self.is_exporting = False
+            self.export_thread = None
+
+        if self.export_thread and not self.export_thread.is_alive():
+            self.export_thread = None
+
         if self.is_exporting:
             return False, "Export already in progress"
 
@@ -231,128 +210,87 @@ class ExportManager:
 
         self.is_exporting = True
         self.export_thread = threading.Thread(
-            target=self._export_worker, args=(weights_path, export_format)
+            target=self._export_worker,
+            args=(project_path, weights_path, export_format),
         )
         self.export_thread.start()
         return True, "Export started successfully"
 
-    def _export_worker(self, weights_path: str, export_format: str):
+    def _export_worker(
+        self, project_path: str, weights_path: str, export_format: str
+    ):
         try:
             self.notify_callbacks(
                 "export_started",
                 {"weights_path": weights_path, "format": export_format},
             )
-            self.notify_callbacks(
-                "export_log", {"message": "Checking export environment..."}
+            self._emit_export_log("Checking export runtime environment...")
+            runtime_ok, runtime_message, runtime_python = (
+                ensure_ultralytics_runtime(
+                    log_callback=self._emit_export_log,
+                    extra_packages=EXPORT_RUNTIME_PACKAGES.get(
+                        export_format, []
+                    ),
+                )
             )
-            missing_packages = get_export_validator(export_format)()
-            if missing_packages:
+            if not runtime_ok:
                 self.notify_callbacks(
-                    "export_log",
-                    {
-                        "message": f"Missing required packages: {', '.join(missing_packages)}"
-                    },
+                    "export_error",
+                    {"error": runtime_message},
                 )
-                self.notify_callbacks(
-                    "export_log",
-                    {"message": "Attempting to install missing packages..."},
-                )
-                success, stdout, stderr = install_packages_with_timeout(
-                    missing_packages, timeout=30
-                )
-                if not success:
-                    error_msg = f"Failed to install required packages: {', '.join(missing_packages)}. Please manually install these packages and restart the application."
-                    self.notify_callbacks("export_error", {"error": error_msg})
-                    return
-                self.notify_callbacks(
-                    "export_log",
-                    {"message": "Required packages installed successfully"},
-                )
-            else:
-                self.notify_callbacks(
-                    "export_log",
-                    {"message": "All required packages are available"},
-                )
+                return
 
-            original_stdout = sys.stdout
-            original_stderr = sys.stderr
-
-            log_redirector = ExportLogRedirector()
-            sys.stdout = log_redirector
-            sys.stderr = log_redirector
-
-            try:
-                from ultralytics import YOLO
-
-                self.notify_callbacks(
-                    "export_log",
-                    {"message": f"Loading model from {weights_path}"},
+            if export_format == "ncnn":
+                custom_ok, custom_result = run_custom_ncnn_export(
+                    runtime_python=runtime_python,
+                    project_path=project_path,
+                    weights_path=weights_path,
+                    log_callback=self._emit_export_log,
                 )
-                model = YOLO(weights_path)
-
-                self.notify_callbacks(
-                    "export_log",
-                    {
-                        "message": f"Starting export to {export_format} format..."
-                    },
-                )
-                results = model.export(format=export_format)
-
-                exported_path = (
-                    results if isinstance(results, str) else str(results)
-                )
-                if not exported_path:
-                    weights_dir = os.path.dirname(weights_path)
-                    model_name = os.path.splitext(
-                        os.path.basename(weights_path)
-                    )[0]
-                    exported_path = os.path.join(
-                        weights_dir, f"{model_name}.{export_format}"
-                    )
-
-                if os.path.exists(exported_path):
+                if custom_ok:
                     self.notify_callbacks(
                         "export_completed",
                         {
-                            "exported_path": exported_path,
+                            "exported_path": custom_result,
                             "format": export_format,
                         },
                     )
-                else:
-                    possible_path = weights_path.replace(
-                        ".pt", f".{export_format}"
-                    )
-                    if os.path.exists(possible_path):
-                        self.notify_callbacks(
-                            "export_completed",
-                            {
-                                "exported_path": possible_path,
-                                "format": export_format,
-                            },
-                        )
-                    else:
-                        self.notify_callbacks(
-                            "export_error",
-                            {
-                                "error": "Export completed but output file not found"
-                            },
-                        )
-
-            except ImportError as e:
-                self.notify_callbacks(
-                    "export_error",
-                    {"error": f"Failed to import ultralytics: {str(e)}"},
+                    return
+                self._emit_export_log(
+                    f"[NCNN] Custom exporter failed, fallback to default path: {custom_result}"
                 )
-            except Exception as e:
-                self.notify_callbacks(
-                    "export_error", {"error": f"Export failed: {str(e)}"}
-                )
-            finally:
-                sys.stdout = original_stdout
-                sys.stderr = original_stderr
 
-                if os.environ.get("CUDA_VISIBLE_DEVICES") == "":
-                    del os.environ["CUDA_VISIBLE_DEVICES"]
+            self._emit_export_log(f"Loading model from {weights_path}")
+            self._emit_export_log(
+                f"Starting export to {export_format} format..."
+            )
+
+            success, result = self._run_export_subprocess(
+                runtime_python, weights_path, export_format
+            )
+            if not success:
+                self.notify_callbacks(
+                    "export_error", {"error": f"Export failed: {result}"}
+                )
+                return
+
+            exported_path = self._resolve_exported_path(
+                weights_path, export_format, result
+            )
+            if exported_path and os.path.exists(exported_path):
+                self.notify_callbacks(
+                    "export_completed",
+                    {
+                        "exported_path": exported_path,
+                        "format": export_format,
+                    },
+                )
+                return
+
+            self.notify_callbacks(
+                "export_error",
+                {"error": "Export completed but output file not found"},
+            )
 
         except Exception as e:
             self.notify_callbacks(
@@ -361,14 +299,19 @@ class ExportManager:
             )
         finally:
             self.is_exporting = False
+            self.export_thread = None
 
     def stop_export(self) -> bool:
-        if not self.is_exporting:
+        if not self.is_exporting and not (
+            self.export_thread and self.export_thread.is_alive()
+        ):
             return False
 
         self.is_exporting = False
         if self.export_thread and self.export_thread.is_alive():
             self.export_thread.join(timeout=5)
+        if self.export_thread and not self.export_thread.is_alive():
+            self.export_thread = None
 
         self.notify_callbacks("export_stopped", {})
         return True
