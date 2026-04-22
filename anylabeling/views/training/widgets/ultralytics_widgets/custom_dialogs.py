@@ -7,7 +7,7 @@ from anylabeling.views.labeling.utils.theme import get_theme
 
 
 class ExportFormatDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, allowed_formats=None):
         super().__init__(parent)
         self.setWindowTitle(self.tr("Export Settings"))
         self.setFixedSize(400, 220)
@@ -45,6 +45,16 @@ class ExportFormatDialog(QDialog):
             ("IMX500", "imx"),
             ("RKNN", "rknn"),
         ]
+
+        if allowed_formats:
+            allowed_set = {str(item).strip().lower() for item in allowed_formats}
+            formats = [
+                (display_name, format_code)
+                for display_name, format_code in formats
+                if format_code.lower() in allowed_set
+            ]
+            if not formats:
+                formats = [("NCNN", "ncnn")]
 
         for display_name, format_code in formats:
             self.format_combo.addItem(display_name, format_code)

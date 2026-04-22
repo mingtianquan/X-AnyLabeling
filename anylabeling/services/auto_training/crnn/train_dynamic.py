@@ -2,6 +2,7 @@ import argparse
 import random
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -13,7 +14,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from .labeling import generate_labels_file, parse_image_exts
+try:
+    from .labeling import generate_labels_file, parse_image_exts
+except ImportError:
+    # Allow running this file directly: python train_dynamic.py ...
+    current_dir = Path(__file__).resolve().parent
+    if str(current_dir) not in sys.path:
+        sys.path.insert(0, str(current_dir))
+    from labeling import generate_labels_file, parse_image_exts
 
 
 DEFAULT_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -468,6 +476,11 @@ def parse_args():
     parser.add_argument("--max-img-w", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Training device: auto/cpu/cuda/0/1/0,1 ...",
+    )
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--train-ratio", type=float, default=0.9)
@@ -487,10 +500,32 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_device(device_arg: str) -> torch.device:
+    value = str(device_arg or "auto").strip().lower()
+    if value in {"", "auto"}:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if value == "cpu":
+        return torch.device("cpu")
+    if value in {"cuda", "gpu"}:
+        if torch.cuda.is_available():
+            return torch.device("cuda:0")
+        return torch.device("cpu")
+
+    if "," in value:
+        value = value.split(",", 1)[0].strip()
+    if value.isdigit():
+        gpu_index = int(value)
+        if torch.cuda.is_available() and gpu_index < torch.cuda.device_count():
+            return torch.device(f"cuda:{gpu_index}")
+        return torch.device("cpu")
+
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
     print(f"[env] device={device}", flush=True)
 
     data_root = Path(args.data_root).resolve()

@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import json
 import yaml
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -35,13 +36,19 @@ def validate_basic_config(
         return "directory_exists", save_dir
 
     model_path = basic.get("model", "").strip()
-    if not model_path or not os.path.exists(model_path):
-        return False, "Valid model file is required"
+    if task_type == "CRNN":
+        if model_path and not os.path.exists(model_path):
+            return False, "Resume model file does not exist"
+    else:
+        if not model_path or not os.path.exists(model_path):
+            return False, "Valid model file is required"
 
     data_path = basic.get("data", "").strip()
     if data_path and not os.path.exists(data_path):
         if task_type == "Classify":
             return False, "Valid data directory is required"
+        if task_type == "CRNN":
+            return False, "Valid data path is required"
         return False, "Valid data file is required"
 
     return True, ""
@@ -126,7 +133,10 @@ def validate_task_requirements(
     if not image_list:
         return False, "Please load images first"
 
-    valid_images = get_task_valid_images(image_list, task_type, output_dir)
+    if task_type == "CRNN":
+        valid_images = _get_crnn_valid_images(image_list, output_dir)
+    else:
+        valid_images = get_task_valid_images(image_list, task_type, output_dir)
 
     if valid_images < MIN_LABELED_IMAGES_THRESHOLD:
         return (
@@ -135,3 +145,47 @@ def validate_task_requirements(
         )
 
     return True, ""
+
+
+def _get_crnn_valid_images(
+    image_list: List[str], output_dir: Optional[str] = None
+) -> int:
+    """Count images that have usable CRNN labels.
+
+    Priority:
+    1. image-level json `description`
+    2. first shape `description`
+    3. filename prefix before "_"
+    """
+    from anylabeling.views.labeling.label_converter import LabelConverter
+
+    converter = LabelConverter()
+    valid_count = 0
+
+    for image_file in image_list:
+        label_dir, filename = os.path.split(image_file)
+        if output_dir:
+            label_dir = output_dir
+        label_file = os.path.join(
+            label_dir, os.path.splitext(filename)[0] + ".json"
+        )
+
+        if os.path.exists(label_file):
+            try:
+                with open(label_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    continue
+            except Exception:
+                continue
+
+        label_text = converter.custom_to_crnn(
+            image_file=image_file,
+            label_file=label_file,
+            split_char="_",
+            fallback_from_filename=True,
+        )
+        if label_text:
+            valid_count += 1
+
+    return valid_count

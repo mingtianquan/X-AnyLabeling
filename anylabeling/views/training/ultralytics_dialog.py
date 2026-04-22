@@ -1,13 +1,15 @@
 import csv
+import copy
 import datetime
 import glob
+import json
 import os
 import platform
 import re
 import shutil
 import subprocess
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QDialog,
@@ -55,8 +57,133 @@ from anylabeling.services.auto_training.ultralytics.utils import *
 from anylabeling.services.auto_training.ultralytics.validators import (
     validate_basic_config,
     validate_data_file,
-    validate_task_requirements,
 )
+
+
+class CRNNPrepareThread(QThread):
+    prepare_log = pyqtSignal(str)
+    prepare_success = pyqtSignal(object)
+    prepare_failed = pyqtSignal(str)
+
+    def __init__(self, prepare_fn, config_snapshot, parent=None):
+        super().__init__(parent)
+        self._prepare_fn = prepare_fn
+        self._config_snapshot = config_snapshot
+
+    def run(self):
+        try:
+            train_args = self._prepare_fn(
+                self._config_snapshot,
+                log_callback=self.prepare_log.emit,
+            )
+            self.prepare_success.emit(train_args)
+        except Exception as e:
+            self.prepare_failed.emit(str(e))
+
+
+class DatasetSummaryThread(QThread):
+    summary_completed = pyqtSignal(int, str, object)
+    summary_failed = pyqtSignal(int, str, str)
+
+    def __init__(
+        self,
+        request_id,
+        task_type,
+        image_list,
+        supported_shape,
+        output_dir=None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._request_id = int(request_id)
+        self._task_type = str(task_type or "")
+        self._image_list = list(image_list or [])
+        self._supported_shape = list(supported_shape or [])
+        self._output_dir = output_dir
+
+    def run(self):
+        try:
+            if self._task_type == "Classify":
+                table_data = self._compute_classification_data()
+            elif self._task_type == "CRNN":
+                table_data = self._compute_crnn_data()
+            else:
+                table_data = get_statistics_table_data(
+                    self._image_list,
+                    self._supported_shape,
+                    self._output_dir,
+                )
+
+            if self.isInterruptionRequested():
+                return
+            self.summary_completed.emit(
+                self._request_id, self._task_type, table_data
+            )
+        except Exception as e:
+            self.summary_failed.emit(
+                self._request_id, self._task_type, str(e)
+            )
+
+    def _compute_classification_data(self):
+        headers = ["Label"] + self._supported_shape + ["Total"]
+        classify_shapes = TASK_SHAPE_MAPPINGS.get("Classify", ["flags"])
+        label_infos = get_label_infos(
+            self._image_list, classify_shapes, self._output_dir
+        )
+        if not label_infos:
+            return [headers]
+
+        table_data = [headers]
+        total_counts = [0] * len(self._supported_shape)
+        total_images = 0
+
+        for label, infos in sorted(label_infos.items()):
+            shape_counts = [0] * len(self._supported_shape)
+            image_count = infos.get("_total", 0)
+            total_images += image_count
+            row = [label] + [str(c) for c in shape_counts] + [str(image_count)]
+            table_data.append(row)
+
+        total_row = (
+            ["Total"] + [str(c) for c in total_counts] + [str(total_images)]
+        )
+        table_data.append(total_row)
+        return table_data
+
+    def _compute_crnn_data(self):
+        from anylabeling.views.labeling.label_converter import LabelConverter
+
+        headers = ["Label", "Total"]
+        converter = LabelConverter()
+        label_counter = {}
+        total_count = 0
+
+        for image_file in self._image_list:
+            if self.isInterruptionRequested():
+                return [headers]
+
+            label_dir, filename = os.path.split(image_file)
+            if self._output_dir:
+                label_dir = self._output_dir
+            label_file = os.path.join(
+                label_dir, os.path.splitext(filename)[0] + ".json"
+            )
+            label_text = converter.custom_to_crnn(
+                image_file=image_file,
+                label_file=label_file,
+                split_char="_",
+                fallback_from_filename=True,
+            )
+            if not label_text:
+                continue
+            label_counter[label_text] = label_counter.get(label_text, 0) + 1
+            total_count += 1
+
+        table_data = [headers]
+        for label in sorted(label_counter.keys()):
+            table_data.append([label, str(label_counter[label])])
+        table_data.append(["Total", str(total_count)])
+        return table_data
 
 
 class UltralyticsDialog(QDialog):
@@ -80,6 +207,7 @@ class UltralyticsDialog(QDialog):
         self.config_widgets = {}
         self._classification_cache = None
         self._detection_cache = None
+        self._crnn_cache = None
         self.task_type_buttons = {}
         self.names = []
 
@@ -115,9 +243,13 @@ class UltralyticsDialog(QDialog):
         self.progress_timer.timeout.connect(self.update_training_progress)
         self.image_timer = QTimer()
         self.image_timer.timeout.connect(self.update_training_images)
+        self.crnn_prepare_thread = None
+        self.dataset_summary_thread = None
+        self._summary_request_id = 0
         self.current_project_path = None
         self.training_status = "idle"  # idle, training, completed, error
         self.current_epochs = 0
+        self.total_epochs = 0
 
         app_config = get_config()
         self.project_readonly = (
@@ -172,24 +304,6 @@ class UltralyticsDialog(QDialog):
 
         except Exception as e:
             logger.error(f"Failed to save training logs: {str(e)}")
-
-    def closeEvent(self, event):
-        """Handle window close event"""
-        if self.training_status == "training":
-            QMessageBox.warning(
-                self,
-                self.tr("Training in Progress"),
-                self.tr(
-                    "Cannot close window while training is in progress. Please stop training first."
-                ),
-            )
-            event.ignore()
-            return
-
-        if self.training_status in ["completed", "error", "stop"]:
-            self.save_training_logs_to_file()
-
-        super().closeEvent(event)
 
     def go_to_specific_tab(self, index):
         """Go to specific tab by index"""
@@ -252,6 +366,7 @@ class UltralyticsDialog(QDialog):
             else:
                 self.hide_pose_config()
 
+        self._apply_task_type_ui_hints()
         self.refresh_dataset_summary()
 
     def create_task_handler(self, task_type):
@@ -259,6 +374,38 @@ class UltralyticsDialog(QDialog):
             self.on_task_type_selected(task_type)
 
         return handler
+
+    def _apply_task_type_ui_hints(self):
+        model_widget = self.config_widgets.get("model")
+        data_widget = self.config_widgets.get("data")
+        imgsz_widget = self.config_widgets.get("imgsz")
+
+        if self.selected_task_type == "CRNN":
+            if model_widget is not None:
+                model_widget.setPlaceholderText(
+                    self.tr(
+                        "Optional resume checkpoint (.pth). Leave empty to train from scratch."
+                    )
+                )
+            if data_widget is not None:
+                data_widget.setPlaceholderText(
+                    self.tr(
+                        "Optional dataset root containing labels.txt; leave empty to auto-build from current annotations"
+                    )
+                )
+            if imgsz_widget is not None and imgsz_widget.value() == 640:
+                imgsz_widget.setValue(32)
+        else:
+            if model_widget is not None:
+                model_widget.setPlaceholderText("")
+            if data_widget is not None:
+                data_widget.setPlaceholderText("")
+            if (
+                imgsz_widget is not None
+                and imgsz_widget.value() == 32
+                and self.selected_task_type in {"Detect", "OBB", "Segment", "Pose"}
+            ):
+                imgsz_widget.setValue(640)
 
     def init_task_configuration(self, parent_layout):
         config_widget = QWidget()
@@ -277,16 +424,108 @@ class UltralyticsDialog(QDialog):
         parent_layout.addWidget(config_widget)
 
     def refresh_dataset_summary(self):
+        self._stop_dataset_summary_thread_if_running()
+
         if not self.image_list:
             self.summary_table.clear()
             return
 
-        if self.selected_task_type == "Classify":
-            table_data = self._get_classification_table_data()
-        else:
-            table_data = self._get_detection_table_data()
+        if self.selected_task_type is None:
+            table_data = [
+                ["Metric", "Value"],
+                ["Total Images", str(len(self.image_list))],
+                [
+                    "Task",
+                    self.tr("Select task type to load detailed statistics"),
+                ],
+            ]
+            self.summary_table.load_data(table_data)
+            return
 
-        self.summary_table.load_data(table_data)
+        if self.selected_task_type == "Classify" and self._classification_cache:
+            self.summary_table.load_data(self._classification_cache)
+            return
+        if self.selected_task_type == "CRNN" and self._crnn_cache:
+            self.summary_table.load_data(self._crnn_cache)
+            return
+        if (
+            self.selected_task_type not in {"Classify", "CRNN"}
+            and self._detection_cache
+        ):
+            self.summary_table.load_data(self._detection_cache)
+            return
+
+        self._summary_request_id += 1
+        request_id = self._summary_request_id
+
+        self.summary_table.load_data(
+            [
+                ["Metric", "Value"],
+                ["Task", self.selected_task_type],
+                ["Status", self.tr("Loading summary...")],
+            ]
+        )
+        self.dataset_summary_thread = DatasetSummaryThread(
+            request_id=request_id,
+            task_type=self.selected_task_type,
+            image_list=list(self.image_list),
+            supported_shape=list(self.supported_shape),
+            output_dir=self.output_dir,
+            parent=self,
+        )
+        self.dataset_summary_thread.summary_completed.connect(
+            self._on_dataset_summary_completed,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.dataset_summary_thread.summary_failed.connect(
+            self._on_dataset_summary_failed,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.dataset_summary_thread.finished.connect(
+            self._on_dataset_summary_finished,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.dataset_summary_thread.start()
+
+    def _stop_dataset_summary_thread_if_running(self):
+        if (
+            self.dataset_summary_thread
+            and self.dataset_summary_thread.isRunning()
+        ):
+            self.dataset_summary_thread.requestInterruption()
+            self.dataset_summary_thread.wait(2000)
+
+    def _on_dataset_summary_completed(self, request_id, task_type, table_data):
+        if request_id != self._summary_request_id:
+            return
+        if task_type != self.selected_task_type:
+            return
+
+        if task_type == "Classify":
+            self._classification_cache = table_data
+        elif task_type == "CRNN":
+            self._crnn_cache = table_data
+        else:
+            self._detection_cache = table_data
+
+        self.summary_table.load_data(table_data or [])
+
+    def _on_dataset_summary_failed(self, request_id, task_type, error_message):
+        if request_id != self._summary_request_id:
+            return
+        if task_type != self.selected_task_type:
+            return
+        self.summary_table.load_data(
+            [
+                ["Metric", "Value"],
+                ["Task", task_type],
+                ["Status", self.tr("Failed to load summary")],
+                ["Error", str(error_message)],
+            ]
+        )
+
+    def _on_dataset_summary_finished(self):
+        self.dataset_summary_thread = None
 
     def _get_classification_table_data(self):
         if self._classification_cache is None:
@@ -297,6 +536,11 @@ class UltralyticsDialog(QDialog):
         if self._detection_cache is None:
             self._detection_cache = self._compute_detection_data()
         return self._detection_cache
+
+    def _get_crnn_table_data(self):
+        if self._crnn_cache is None:
+            self._crnn_cache = self._compute_crnn_data()
+        return self._crnn_cache
 
     def _compute_classification_data(self):
         headers = ["Label"] + self.supported_shape + ["Total"]
@@ -334,11 +578,55 @@ class UltralyticsDialog(QDialog):
             self.image_list, self.supported_shape, self.output_dir
         )
 
+    def _compute_crnn_data(self):
+        from anylabeling.views.labeling.label_converter import LabelConverter
+
+        headers = ["Label", "Total"]
+        converter = LabelConverter()
+        label_counter = {}
+        total_count = 0
+
+        for image_file in self.image_list:
+            label_dir, filename = os.path.split(image_file)
+            if self.output_dir:
+                label_dir = self.output_dir
+            label_file = os.path.join(
+                label_dir, os.path.splitext(filename)[0] + ".json"
+            )
+            label_text = converter.custom_to_crnn(
+                image_file=image_file,
+                label_file=label_file,
+                split_char="_",
+                fallback_from_filename=True,
+            )
+            if not label_text:
+                continue
+            label_counter[label_text] = label_counter.get(label_text, 0) + 1
+            total_count += 1
+
+        table_data = [headers]
+        for label in sorted(label_counter.keys()):
+            table_data.append([label, str(label_counter[label])])
+        table_data.append(["Total", str(total_count)])
+        return table_data
+
     def clear_cache(self):
         self._classification_cache = None
         self._detection_cache = None
+        self._crnn_cache = None
 
     def closeEvent(self, event):
+        if self.crnn_prepare_thread and self.crnn_prepare_thread.isRunning():
+            QMessageBox.warning(
+                self,
+                self.tr("Preparing Training"),
+                self.tr(
+                    "Cannot close window while training is being prepared. Please wait for preparation to finish."
+                ),
+            )
+            event.ignore()
+            return
+
         if self.training_status == "training":
             QMessageBox.warning(
                 self,
@@ -363,6 +651,7 @@ class UltralyticsDialog(QDialog):
         if self.training_status in ["completed", "error", "stop"]:
             self.save_training_logs_to_file()
 
+        self._stop_dataset_summary_thread_if_running()
         self.clear_cache()
         super().closeEvent(event)
 
@@ -382,12 +671,19 @@ class UltralyticsDialog(QDialog):
         parent_layout.addWidget(summary_widget, 1)
 
     def proceed_to_config(self):
-        is_valid, error_message = validate_task_requirements(
-            self.selected_task_type, self.image_list, self.output_dir
-        )
-        if not is_valid:
+        if not self.selected_task_type:
             QMessageBox.warning(
-                self, self.tr("Validation Error"), error_message
+                self,
+                self.tr("Validation Error"),
+                self.tr("Please select a task type"),
+            )
+            return
+
+        if not self.image_list:
+            QMessageBox.warning(
+                self,
+                self.tr("Validation Error"),
+                self.tr("Please load images first"),
             )
             return
 
@@ -431,11 +727,14 @@ class UltralyticsDialog(QDialog):
 
     # Config Tab
     def browse_model_file(self):
+        file_filter = "Model Files (*.pt);;All Files (*)"
+        if self.selected_task_type == "CRNN":
+            file_filter = "Model Files (*.pth *.pt);;All Files (*)"
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             self.tr("Select Model File"),
             "",
-            "Model Files (*.pt);;All Files (*)",
+            file_filter,
         )
         if file_path:
             self.config_widgets["model"].setText(file_path)
@@ -444,6 +743,14 @@ class UltralyticsDialog(QDialog):
         if self.selected_task_type == "Classify":
             dir_path = QFileDialog.getExistingDirectory(
                 self, self.tr("Select Classification Dataset Directory"), ""
+            )
+            if dir_path:
+                self.config_widgets["data"].setText(dir_path)
+        elif self.selected_task_type == "CRNN":
+            dir_path = QFileDialog.getExistingDirectory(
+                self,
+                self.tr("Select CRNN Dataset Root (optional)"),
+                "",
             )
             if dir_path:
                 self.config_widgets["data"].setText(dir_path)
@@ -1242,9 +1549,7 @@ class UltralyticsDialog(QDialog):
         )
         if is_valid == "directory_exists":
             project_dir = error_message
-            potential_model_path = os.path.join(
-                project_dir, "weights", "best.pt"
-            )
+            potential_model_path = self._get_existing_model_path(project_dir)
 
             if os.path.exists(potential_model_path):
                 reply = QMessageBox.question(
@@ -1450,6 +1755,8 @@ class UltralyticsDialog(QDialog):
                     "max_count": 3,
                 },
             ]
+        elif self.selected_task_type == "CRNN":
+            image_configs = []
         else:
             image_configs = [
                 {"patterns": ["train_batch*.jpg"], "max_count": 3},
@@ -1555,7 +1862,31 @@ class UltralyticsDialog(QDialog):
         elif event_type == "training_log":
             log_message = data.get("message", "")
             if log_message:
+                self._update_crnn_progress_from_log(log_message)
                 self.append_training_log(log_message)
+
+    def _update_crnn_progress_from_log(self, log_message: str):
+        if self.selected_task_type != "CRNN":
+            return
+
+        match = re.search(
+            r"\[epoch\s+(\d+)\s*/\s*(\d+)\]",
+            log_message,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return
+
+        current_epoch = int(match.group(1))
+        total_epoch = int(match.group(2))
+        if total_epoch <= 0:
+            return
+
+        self.total_epochs = total_epoch
+        self.current_epochs = current_epoch
+        progress = min(100, int((current_epoch / total_epoch) * 100))
+        self.progress_bar.setValue(progress)
+        self.progress_bar.setFormat(f"{current_epoch}/{total_epoch}")
 
     def append_training_log(self, text):
         def clean_ansi_codes(text: str) -> str:
@@ -1759,13 +2090,25 @@ class UltralyticsDialog(QDialog):
                 self.append_training_log(self.tr("Cancel to stop training"))
 
     def _build_auto_data_yaml(self) -> str:
-        if self.selected_task_type in [None, "Classify"]:
+        return self._build_auto_data_yaml_with_log()
+
+    def _log_training_message(self, text, log_callback=None):
+        if log_callback:
+            log_callback(str(text))
+        else:
+            self.append_training_log(str(text))
+
+    def _build_auto_data_yaml_with_log(
+        self, log_callback=None, task_type=None, image_files=None
+    ) -> str:
+        selected_task = task_type if task_type is not None else self.selected_task_type
+        images = image_files if image_files is not None else self.image_list
+
+        if selected_task in [None, "Classify"]:
             return ""
 
-        valid_shapes = TASK_SHAPE_MAPPINGS.get(self.selected_task_type, [])
-        label_infos = get_label_infos(
-            self.image_list, valid_shapes, self.output_dir
-        )
+        valid_shapes = TASK_SHAPE_MAPPINGS.get(selected_task, [])
+        label_infos = get_label_infos(images, valid_shapes, self.output_dir)
         class_names = sorted(label_infos.keys())
 
         if not class_names:
@@ -1786,30 +2129,235 @@ class UltralyticsDialog(QDialog):
             )
 
         self.names = class_names
-        self.config_widgets["data"].setText(auto_data_path)
-        self.append_training_log(
-            f"Auto-generated data.yaml: {auto_data_path} (classes: {len(class_names)})"
+        self._log_training_message(
+            f"Auto-generated data.yaml: {auto_data_path} (classes: {len(class_names)})",
+            log_callback,
         )
         return auto_data_path
 
-    def get_training_args(self, config):
+    def _get_existing_model_path(self, project_dir: str) -> str:
+        if self.selected_task_type == "CRNN":
+            candidates = [
+                os.path.join(project_dir, "weights", "best_crnn_dynamic.pth"),
+                os.path.join(project_dir, "weights", "latest_crnn_dynamic.pth"),
+                os.path.join(project_dir, "best_crnn_dynamic.pth"),
+                os.path.join(project_dir, "latest_crnn_dynamic.pth"),
+            ]
+        else:
+            candidates = [os.path.join(project_dir, "weights", "best.pt")]
+
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return candidates[0]
+
+    def _resolve_device_value(self, config_device_value):
+        device_value = config_device_value
+        if device_value == "cuda" and hasattr(self, "device_checkboxes"):
+            selected_gpus = []
+            has_cuda_selector = False
+            if hasattr(self, "_cuda_layout") and self._cuda_layout:
+                has_cuda_selector = self._cuda_layout.count() > 0
+                for i in range(self._cuda_layout.count()):
+                    widget = self._cuda_layout.itemAt(i).widget()
+                    if (
+                        widget
+                        and hasattr(widget, "isChecked")
+                        and widget.isChecked()
+                    ):
+                        gpu_text = widget.text()
+                        gpu_id = gpu_text.split()[-1]
+                        selected_gpus.append(int(gpu_id))
+            if has_cuda_selector:
+                device_value = selected_gpus if selected_gpus else "cpu"
+            else:
+                device_value = 0
+        return device_value
+
+    def _build_crnn_labels_dataset(
+        self, config, log_callback=None, image_files=None
+    ) -> tuple[str, str]:
+        from anylabeling.views.labeling.label_converter import LabelConverter
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        dataset_dir = os.path.join(get_dataset_path(), "crnn", f"auto_data_{timestamp}")
+        os.makedirs(dataset_dir, exist_ok=True)
+        labels_file = os.path.join(dataset_dir, "labels.txt")
+
+        only_checked_files = bool(
+            config.get("checkpoint", {}).get("only_checked_files", False)
+        )
+        converter = LabelConverter()
+        lines = []
+
+        images = image_files if image_files is not None else self.image_list
+        for image_file in images:
+            label_dir, filename = os.path.split(image_file)
+            if self.output_dir:
+                label_dir = self.output_dir
+            label_file = os.path.join(
+                label_dir, os.path.splitext(filename)[0] + ".json"
+            )
+
+            if only_checked_files and os.path.exists(label_file):
+                try:
+                    with open(label_file, "r", encoding="utf-8") as f:
+                        info = json.load(f)
+                    if not info.get("checked", False):
+                        continue
+                except Exception:
+                    continue
+
+            label_text = converter.custom_to_crnn(
+                image_file=image_file,
+                label_file=label_file,
+                split_char="_",
+                fallback_from_filename=True,
+            )
+            if not label_text:
+                continue
+
+            abs_image = os.path.abspath(image_file).replace("\\", "/")
+            lines.append(f"{abs_image}\t{label_text}")
+
+        lines.sort()
+        with open(labels_file, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
+
+        if not lines:
+            raise ValueError(
+                "No valid CRNN labels found. Please set json description or use filename prefix like 1234_xxx.jpg"
+            )
+
+        self._log_training_message(
+            f"Created CRNN labels file: {labels_file} (samples: {len(lines)})",
+            log_callback,
+        )
+        return dataset_dir, labels_file
+
+    def _get_crnn_training_args(self, config, log_callback=None, image_files=None):
+        project = config["basic"]["project"]
+        name = config["basic"]["name"]
+        project_path = os.path.join(project, name)
+        weights_dir = os.path.join(project_path, "weights")
+        os.makedirs(weights_dir, exist_ok=True)
+
+        data_input = config["basic"].get("data", "").strip()
+        if data_input:
+            if os.path.isdir(data_input):
+                data_root = data_input
+                labels_file = os.path.join(data_root, "labels.txt")
+                if not os.path.exists(labels_file):
+                    raise ValueError(
+                        f"labels.txt not found in CRNN dataset root: {data_root}"
+                    )
+                self._log_training_message(
+                    f"Using CRNN dataset root: {data_root}",
+                    log_callback,
+                )
+            elif os.path.isfile(data_input):
+                labels_file = data_input
+                data_root = os.path.dirname(labels_file) or "."
+                self._log_training_message(
+                    f"Using CRNN labels file: {labels_file}",
+                    log_callback,
+                )
+            else:
+                raise ValueError(
+                    "CRNN data must be an existing dataset root directory or labels.txt file"
+                )
+        else:
+            data_root, labels_file = self._build_crnn_labels_dataset(
+                config,
+                log_callback=log_callback,
+                image_files=image_files,
+            )
+
+        device_value = config["basic"].get("device_resolved")
+        if device_value is None:
+            device_value = self._resolve_device_value(config["basic"]["device"])
+        model_path = config["basic"].get("model", "").strip()
+        train_ratio = config["basic"].get("dataset_ratio", 0.8)
+        lr0 = config.get("learning_rate", {}).get("lr0", 0.001)
+        weight_decay = config.get("learning_rate", {}).get("weight_decay", 1e-4)
+
+        train_args = {
+            "__task_type__": "crnn",
+            "project": project,
+            "name": name,
+            "device": device_value,
+            "data_root": data_root,
+            "labels_file": labels_file,
+            "charset_file": os.path.join(project_path, "charset.txt"),
+            "best_model": os.path.join(weights_dir, "best_crnn_dynamic.pth"),
+            "latest_model": os.path.join(weights_dir, "latest_crnn_dynamic.pth"),
+            "epochs": int(config.get("train", {}).get("epochs", 50)),
+            "batch_size": int(config.get("train", {}).get("batch", 32)),
+            "num_workers": int(config.get("train", {}).get("workers", 0)),
+            "train_ratio": float(train_ratio),
+            "img_h": int(config.get("train", {}).get("imgsz", 32)),
+            "lr": float(lr0) if float(lr0) > 0 else 0.001,
+            "weight_decay": (
+                float(weight_decay) if float(weight_decay) >= 0 else 1e-4
+            ),
+            "resume": model_path if model_path and os.path.exists(model_path) else "",
+        }
+
+        cmd_parts = [
+            "python",
+            "crnn/train_dynamic.py",
+            f"--data-root={train_args['data_root']}",
+            f"--labels-file={train_args['labels_file']}",
+            f"--best-model={train_args['best_model']}",
+            f"--latest-model={train_args['latest_model']}",
+            f"--epochs={train_args['epochs']}",
+            f"--batch-size={train_args['batch_size']}",
+            f"--train-ratio={train_args['train_ratio']}",
+            f"--device={train_args['device']}",
+        ]
+        if train_args["resume"]:
+            cmd_parts.append(f"--resume={train_args['resume']}")
+        self._log_training_message(
+            f"Training command: {' '.join(cmd_parts)}", log_callback
+        )
+        return train_args
+
+    def get_training_args(self, config, log_callback=None):
         try:
+            selected_task_type = config.get(
+                "__selected_task_type__", self.selected_task_type
+            )
+            image_files = config.get("__image_list_snapshot__", None)
+
+            if selected_task_type == "CRNN":
+                return self._get_crnn_training_args(
+                    config,
+                    log_callback=log_callback,
+                    image_files=image_files,
+                )
+
             data_file = config["basic"].get("data", "").strip()
-            if self.selected_task_type != "Classify" and not data_file:
-                data_file = self._build_auto_data_yaml()
+            if selected_task_type != "Classify" and not data_file:
+                data_file = self._build_auto_data_yaml_with_log(
+                    log_callback=log_callback,
+                    task_type=selected_task_type,
+                    image_files=image_files,
+                )
                 config["basic"]["data"] = data_file
 
-            if self.selected_task_type == "Classify" and os.path.isdir(
+            if selected_task_type == "Classify" and os.path.isdir(
                 config["basic"]["data"]
             ):
                 data_path = config["basic"]["data"]
-                self.append_training_log(
-                    f"Using existing dataset: {data_path}"
+                self._log_training_message(
+                    f"Using existing dataset: {data_path}",
+                    log_callback,
                 )
             else:
                 temp_dir = create_yolo_dataset(
-                    self.image_list,
-                    self.selected_task_type,
+                    image_files if image_files is not None else self.image_list,
+                    selected_task_type,
                     config["basic"]["dataset_ratio"],
                     data_file,
                     self.output_dir,
@@ -1818,33 +2366,18 @@ class UltralyticsDialog(QDialog):
                     config["checkpoint"].get("only_checked_files", False),
                 )
                 logger.info(f"Successfully created YOLO dataset at {temp_dir}")
-                self.append_training_log(f"Created dataset: {temp_dir}")
+                self._log_training_message(
+                    f"Created dataset: {temp_dir}", log_callback
+                )
 
-                if self.selected_task_type == "Classify":
+                if selected_task_type == "Classify":
                     data_path = temp_dir
                 else:
                     data_path = os.path.join(temp_dir, "data.yaml")
 
-            device_value = config["basic"]["device"]
-            if device_value == "cuda" and hasattr(self, "device_checkboxes"):
-                selected_gpus = []
-                has_cuda_selector = False
-                if hasattr(self, "_cuda_layout") and self._cuda_layout:
-                    has_cuda_selector = self._cuda_layout.count() > 0
-                    for i in range(self._cuda_layout.count()):
-                        widget = self._cuda_layout.itemAt(i).widget()
-                        if (
-                            widget
-                            and hasattr(widget, "isChecked")
-                            and widget.isChecked()
-                        ):
-                            gpu_text = widget.text()
-                            gpu_id = gpu_text.split()[-1]
-                            selected_gpus.append(int(gpu_id))
-                if has_cuda_selector:
-                    device_value = selected_gpus if selected_gpus else "cpu"
-                else:
-                    device_value = 0
+            device_value = config["basic"].get("device_resolved")
+            if device_value is None:
+                device_value = self._resolve_device_value(config["basic"]["device"])
 
             train_args = {
                 "data": data_path,
@@ -1874,48 +2407,99 @@ class UltralyticsDialog(QDialog):
                 and value != DEFAULT_TRAINING_CONFIG[key]
             }
             train_args.update(advanced_params)
-            self.total_epochs = train_args.get("epochs", 100)
 
             # Log the training command
-            cmd_parts = ["yolo", self.selected_task_type.lower(), "train"]
+            cmd_parts = ["yolo", selected_task_type.lower(), "train"]
             for key, value in train_args.items():
                 cmd_parts.append(f"{key}={value}")
-            self.append_training_log(
-                f"Training command: {' '.join(cmd_parts)}"
+            self._log_training_message(
+                f"Training command: {' '.join(cmd_parts)}",
+                log_callback,
             )
 
             return train_args
 
         except Exception as e:
-            self.append_training_log(
-                f"Error preparing training args: {str(e)}"
+            self._log_training_message(
+                f"Error preparing training args: {str(e)}",
+                log_callback,
             )
             raise
 
     def start_training_from_train_tab(self):
+        if self.crnn_prepare_thread and self.crnn_prepare_thread.isRunning():
+            QMessageBox.warning(
+                self,
+                self.tr("Training Preparation"),
+                self.tr("Training preparation is already in progress"),
+            )
+            return
+
         config = self.get_current_config()
         project_path = config["basic"]["project"]
         name = config["basic"]["name"]
         self.current_project_path = os.path.join(project_path, name)
+        config_snapshot = copy.deepcopy(config)
+        config_snapshot["__selected_task_type__"] = self.selected_task_type
+        config_snapshot["__image_list_snapshot__"] = list(self.image_list)
+        config_snapshot["basic"]["device_resolved"] = self._resolve_device_value(
+            config["basic"]["device"]
+        )
 
         try:
             self.start_training_button.setEnabled(False)
             self.append_training_log(self.tr("Preparing training..."))
-            train_args = self.get_training_args(config)
-            success, message = self.training_manager.start_training(train_args)
-            if not success:
-                self.append_training_log(
-                    f"Failed to start training: {message}"
-                )
-                QMessageBox.critical(self, self.tr("Training Error"), message)
-                self.start_training_button.setEnabled(True)
-                return
+            self.crnn_prepare_thread = CRNNPrepareThread(
+                self.get_training_args,
+                config_snapshot,
+                self,
+            )
+            self.crnn_prepare_thread.prepare_log.connect(
+                self.append_training_log, Qt.ConnectionType.QueuedConnection
+            )
+            self.crnn_prepare_thread.prepare_success.connect(
+                self._on_training_args_prepared,
+                Qt.ConnectionType.QueuedConnection,
+            )
+            self.crnn_prepare_thread.prepare_failed.connect(
+                self._on_training_prepare_failed,
+                Qt.ConnectionType.QueuedConnection,
+            )
+            self.crnn_prepare_thread.finished.connect(
+                self._on_training_prepare_finished,
+                Qt.ConnectionType.QueuedConnection,
+            )
+            self.crnn_prepare_thread.start()
 
         except Exception as e:
             error_msg = f"Failed to start training: {str(e)}"
             self.append_training_log(f"ERROR: {error_msg}")
             QMessageBox.critical(self, self.tr("Training Error"), error_msg)
             self.start_training_button.setEnabled(True)
+
+    def _on_training_args_prepared(self, train_args):
+        self.total_epochs = int(train_args.get("epochs", 100))
+        success, message = self.training_manager.start_training(
+            train_args, self.selected_task_type or ""
+        )
+        if not success:
+            self.append_training_log(f"Failed to start training: {message}")
+            QMessageBox.critical(self, self.tr("Training Error"), message)
+            self.start_training_button.setEnabled(True)
+
+    def _on_training_prepare_failed(self, error_message):
+        self.append_training_log(
+            f"ERROR: Failed to prepare training: {error_message}"
+        )
+        QMessageBox.critical(
+            self,
+            self.tr("Training Error"),
+            f"Failed to prepare training: {error_message}",
+        )
+        self.start_training_button.setEnabled(True)
+
+    def _on_training_prepare_finished(self):
+        self.crnn_prepare_thread = None
 
     def init_training_actions(self, parent_layout):
         actions_layout = QHBoxLayout()
@@ -2011,22 +2595,28 @@ class UltralyticsDialog(QDialog):
             )
             return
 
-        weights_path = os.path.join(
-            self.current_project_path, "weights", "best.pt"
-        )
-        if not os.path.exists(weights_path):
-            QMessageBox.warning(
-                self,
-                self.tr("Model Not Found"),
-                self.tr(f"Model weights not found at: {weights_path}"),
+        if self.selected_task_type != "CRNN":
+            weights_path = os.path.join(
+                self.current_project_path, "weights", "best.pt"
             )
-            return
+            if not os.path.exists(weights_path):
+                QMessageBox.warning(
+                    self,
+                    self.tr("Model Not Found"),
+                    self.tr(f"Model weights not found at: {weights_path}"),
+                )
+                return
 
-        export_dialog = ExportFormatDialog(self)
+        if self.selected_task_type == "CRNN":
+            export_dialog = ExportFormatDialog(self, allowed_formats=["ncnn"])
+        else:
+            export_dialog = ExportFormatDialog(self)
         if export_dialog.exec() == QDialog.DialogCode.Accepted:
             export_format = export_dialog.get_selected_format()
             success, message = self.export_manager.start_export(
-                self.current_project_path, export_format
+                self.current_project_path,
+                export_format,
+                self.selected_task_type or "",
             )
             if not success:
                 QMessageBox.critical(self, self.tr("Export Error"), message)

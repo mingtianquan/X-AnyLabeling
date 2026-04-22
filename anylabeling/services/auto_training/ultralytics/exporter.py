@@ -3,6 +3,7 @@ import json
 import tempfile
 import subprocess
 import threading
+from pathlib import Path
 from io import StringIO
 from typing import Dict, List, Tuple
 
@@ -11,6 +12,11 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from .runtime_env import ensure_ultralytics_runtime
 from .custom_ncnn_export import run_custom_ncnn_export
+
+CRNN_EXPORT_SCRIPT_ENV = "XANYLABELING_CRNN_EXPORT_SCRIPT"
+DEFAULT_CRNN_EXPORT_SCRIPT = str(
+    Path(__file__).resolve().parents[1] / "crnn" / "export_dynamic.py"
+)
 
 
 class ExportEventRedirector(QObject):
@@ -167,6 +173,84 @@ except Exception as e:
                 except Exception:
                     pass
 
+    @staticmethod
+    def _resolve_crnn_export_script_path() -> str:
+        return (
+            os.environ.get(CRNN_EXPORT_SCRIPT_ENV, "").strip()
+            or DEFAULT_CRNN_EXPORT_SCRIPT
+        )
+
+    @staticmethod
+    def _find_crnn_checkpoint(project_path: str) -> str:
+        candidates = [
+            os.path.join(project_path, "weights", "best_crnn_dynamic.pth"),
+            os.path.join(project_path, "weights", "latest_crnn_dynamic.pth"),
+            os.path.join(project_path, "best_crnn_dynamic.pth"),
+            os.path.join(project_path, "latest_crnn_dynamic.pth"),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return ""
+
+    def _run_crnn_export_subprocess(
+        self,
+        runtime_python: str,
+        project_path: str,
+        checkpoint_path: str,
+    ) -> Tuple[bool, str]:
+        script_path = self._resolve_crnn_export_script_path()
+        if not os.path.exists(script_path):
+            return False, f"CRNN export script not found: {script_path}"
+
+        weights_dir = os.path.join(project_path, "weights")
+        os.makedirs(weights_dir, exist_ok=True)
+        torchscript_path = os.path.join(weights_dir, "crnn.pt")
+        ncnn_param_path = os.path.join(weights_dir, "crnn.ncnn.param")
+        ncnn_bin_path = os.path.join(weights_dir, "crnn.ncnn.bin")
+
+        command = [
+            runtime_python,
+            script_path,
+            "--checkpoint",
+            checkpoint_path,
+            "--torchscript-file",
+            torchscript_path,
+            "--ncnn-param-file",
+            ncnn_param_path,
+            "--ncnn-bin-file",
+            ncnn_bin_path,
+            "--pnnx",
+            "pnnx",
+        ]
+        self._emit_export_log(f"[CRNN] $ {' '.join(command)}")
+
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except Exception as e:
+            return False, f"Failed to start CRNN export process: {e}"
+
+        assert process.stdout is not None
+        for line in process.stdout:
+            cleaned = line.rstrip()
+            if cleaned:
+                self._emit_export_log(cleaned)
+
+        return_code = process.wait()
+        if return_code != 0:
+            return False, f"CRNN export failed with exit code {return_code}"
+        if not os.path.exists(ncnn_param_path):
+            return False, f"CRNN export finished but output not found: {ncnn_param_path}"
+        return True, ncnn_param_path
+
     def _resolve_exported_path(
         self, weights_path: str, export_format: str, exported_path: str
     ) -> str:
@@ -189,7 +273,10 @@ except Exception as e:
         return exported_path
 
     def start_export(
-        self, project_path: str, export_format: str = "onnx"
+        self,
+        project_path: str,
+        export_format: str = "onnx",
+        task_type: str = "",
     ) -> Tuple[bool, str]:
         if self.is_exporting:
             if self.export_thread and self.export_thread.is_alive():
@@ -204,17 +291,89 @@ except Exception as e:
         if self.is_exporting:
             return False, "Export already in progress"
 
-        weights_path = os.path.join(project_path, "weights", "best.pt")
-        if not os.path.exists(weights_path):
-            return False, f"Model weights not found at: {weights_path}"
-
+        normalized_task_type = (task_type or "").strip().lower()
         self.is_exporting = True
-        self.export_thread = threading.Thread(
-            target=self._export_worker,
-            args=(project_path, weights_path, export_format),
-        )
+        if normalized_task_type == "crnn":
+            checkpoint_path = self._find_crnn_checkpoint(project_path)
+            if not checkpoint_path:
+                self.is_exporting = False
+                return (
+                    False,
+                    "CRNN checkpoint not found, expected best_crnn_dynamic.pth or latest_crnn_dynamic.pth.",
+                )
+            self.export_thread = threading.Thread(
+                target=self._export_crnn_worker,
+                args=(project_path, checkpoint_path, export_format),
+            )
+        else:
+            weights_path = os.path.join(project_path, "weights", "best.pt")
+            if not os.path.exists(weights_path):
+                self.is_exporting = False
+                return False, f"Model weights not found at: {weights_path}"
+            self.export_thread = threading.Thread(
+                target=self._export_worker,
+                args=(project_path, weights_path, export_format),
+            )
         self.export_thread.start()
         return True, "Export started successfully"
+
+    def _export_crnn_worker(
+        self, project_path: str, checkpoint_path: str, export_format: str
+    ):
+        normalized_format = (export_format or "").strip().lower() or "ncnn"
+        if normalized_format not in {"ncnn"}:
+            self.notify_callbacks(
+                "export_error",
+                {
+                    "error": f"CRNN only supports NCNN export in this UI. Got: {export_format}"
+                },
+            )
+            self.is_exporting = False
+            self.export_thread = None
+            return
+
+        try:
+            self.notify_callbacks(
+                "export_started",
+                {"weights_path": checkpoint_path, "format": "ncnn"},
+            )
+            self._emit_export_log("Checking export runtime environment...")
+            runtime_ok, runtime_message, runtime_python = (
+                ensure_ultralytics_runtime(
+                    log_callback=self._emit_export_log,
+                    extra_packages=["ncnn", "pnnx"],
+                )
+            )
+            if not runtime_ok:
+                self.notify_callbacks(
+                    "export_error",
+                    {"error": runtime_message},
+                )
+                return
+
+            success, result = self._run_crnn_export_subprocess(
+                runtime_python=runtime_python,
+                project_path=project_path,
+                checkpoint_path=checkpoint_path,
+            )
+            if not success:
+                self.notify_callbacks(
+                    "export_error", {"error": f"CRNN export failed: {result}"}
+                )
+                return
+
+            self.notify_callbacks(
+                "export_completed",
+                {"exported_path": result, "format": "ncnn"},
+            )
+        except Exception as e:
+            self.notify_callbacks(
+                "export_error",
+                {"error": f"Unexpected error during CRNN export: {str(e)}"},
+            )
+        finally:
+            self.is_exporting = False
+            self.export_thread = None
 
     def _export_worker(
         self, project_path: str, weights_path: str, export_format: str
@@ -328,7 +487,7 @@ def get_export_manager() -> ExportManager:
 
 
 def export_model(
-    project_path: str, export_format: str = "onnx"
+    project_path: str, export_format: str = "onnx", task_type: str = ""
 ) -> Tuple[bool, str]:
     manager = get_export_manager()
-    return manager.start_export(project_path, export_format)
+    return manager.start_export(project_path, export_format, task_type)

@@ -121,6 +121,58 @@ def _create_file_status_icon(color):
     return QtGui.QIcon(pixmap)
 
 
+class ImageFolderScanThread(QtCore.QThread):
+    scan_finished = QtCore.pyqtSignal(list)
+    scan_failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, dirpath, pattern=None, output_dir=None, parent=None):
+        super().__init__(parent)
+        self.dirpath = dirpath
+        self.pattern = pattern
+        self.output_dir = output_dir
+
+    def run(self):
+        try:
+            search_pattern = (
+                parse_search_pattern(self.pattern) if self.pattern else None
+            )
+            image_files = []
+
+            for file_index, filename in enumerate(
+                utils.scan_all_images(self.dirpath), start=1
+            ):
+                if self.isInterruptionRequested():
+                    return
+
+                if search_pattern:
+                    if search_pattern.mode == "index":
+                        if search_pattern.index != file_index:
+                            continue
+                    else:
+                        if not matches_filename(filename, search_pattern):
+                            continue
+
+                        if search_pattern.mode == "attribute":
+                            label_file = osp.splitext(filename)[0] + ".json"
+                            if self.output_dir:
+                                label_file_without_path = osp.basename(label_file)
+                                label_file = (
+                                    self.output_dir
+                                    + "/"
+                                    + label_file_without_path
+                                )
+                            if not matches_label_attribute(
+                                filename, label_file, search_pattern
+                            ):
+                                continue
+
+                image_files.append(filename)
+
+            self.scan_finished.emit(image_files)
+        except Exception as e:
+            self.scan_failed.emit(str(e))
+
+
 class LabelingWidget(LabelDialog):
     """The main widget for labeling images"""
 
@@ -160,6 +212,15 @@ class LabelingWidget(LabelDialog):
         self.fn_to_index = {}
         self.cache_auto_label = None
         self.cache_auto_label_group_id = None
+        self._image_files_cache = []
+        self._folder_scan_thread = None
+        self._pending_import_files = []
+        self._pending_import_index = 0
+        self._pending_import_load = True
+        self._import_batch_size = 200
+        self._import_batch_timer = QtCore.QTimer()
+        self._import_batch_timer.setInterval(0)
+        self._import_batch_timer.timeout.connect(self._append_import_batch)
 
         # see configs/anylabeling_config.yaml for valid configuration
         if config is None:
@@ -275,6 +336,7 @@ class LabelingWidget(LabelDialog):
         self.shape_text_label = QLabel("Object Text")
         self.shape_text_edit = QPlainTextEdit()
         self.shape_text_edit.setStyleSheet(get_plain_text_edit_style())
+        self.shape_text_edit.installEventFilter(self)
         self.description_checkbox = QCheckBox()
         self.description_checkbox.setChecked(
             self._config["description_dock"]["show"]
@@ -5580,6 +5642,54 @@ class LabelingWidget(LabelDialog):
             return
         super(LabelingWidget, self).keyPressEvent(event)
 
+    def _prepare_image_description_quick_input(self, clear_text: bool = True):
+        self.shape_text_label.setText(self.tr("Image Description"))
+        self.shape_text_edit.setDisabled(False)
+        if clear_text:
+            self.shape_text_edit.blockSignals(True)
+            self.shape_text_edit.setPlainText("")
+            self.shape_text_edit.blockSignals(False)
+        self.shape_text_edit.setFocus()
+        cursor = self.shape_text_edit.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        self.shape_text_edit.setTextCursor(cursor)
+
+    # QT Overload
+    def eventFilter(self, obj, event):
+        if (
+            obj is self.shape_text_edit
+            and event.type() == QtCore.QEvent.Type.KeyPress
+        ):
+            key = event.key()
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                modifiers = event.modifiers()
+                # Keep multiline input ability for explicit newlines.
+                if modifiers & Qt.KeyboardModifier.ShiftModifier:
+                    return super(LabelingWidget, self).eventFilter(obj, event)
+
+                # Enter quick-next only when editing image-level description,
+                # so object description editing behavior remains unchanged.
+                is_object_description_mode = (
+                    self.canvas.current is not None
+                    or (
+                        self.canvas.editing()
+                        and len(self.canvas.selected_shapes) == 1
+                    )
+                )
+                if not is_object_description_mode:
+                    prev_filename = str(self.filename) if self.filename else ""
+                    self.open_next_image()
+                    new_filename = str(self.filename) if self.filename else ""
+                    moved_to_next = bool(new_filename) and (
+                        new_filename != prev_filename
+                    )
+                    self._prepare_image_description_quick_input(
+                        clear_text=moved_to_next
+                    )
+                    return True
+
+        return super(LabelingWidget, self).eventFilter(obj, event)
+
     def resizeEvent(self, _):
         if (
             self.canvas
@@ -5626,6 +5736,10 @@ class LabelingWidget(LabelDialog):
     def closeEvent(self, event):
         if not self.may_continue():
             event.ignore()
+            return
+
+        self._import_batch_timer.stop()
+        self._stop_folder_scan_if_running()
         self.settings.setValue(
             "filename", self.filename if self.filename else ""
         )
@@ -5782,6 +5896,7 @@ class LabelingWidget(LabelDialog):
             if filename:
                 self.file_list_widget.clear()
                 self.fn_to_index.clear()
+                self._image_files_cache = []
                 self.load_file(filename)
 
     def change_output_dir_dialog(self, _value=False):
@@ -6182,22 +6297,33 @@ class LabelingWidget(LabelDialog):
 
     @property
     def image_list(self):
-        lst = []
-        for i in range(self.file_list_widget.count()):
+        widget_count = self.file_list_widget.count()
+        cache_count = len(self._image_files_cache)
+        if widget_count == cache_count:
+            return list(self._image_files_cache)
+
+        rebuilt = []
+        for i in range(widget_count):
             item = self.file_list_widget.item(i)
-            lst.append(item.text())
-        return lst
+            if item is None:
+                continue
+            filename = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if filename:
+                rebuilt.append(filename)
+        self._image_files_cache = rebuilt
+        return list(self._image_files_cache)
 
     def import_dropped_image_files(self, image_files):
         extensions = [
             f".{fmt.data().decode().lower()}"
             for fmt in QtGui.QImageReader.supportedImageFormats()
         ]
+        existing_files = set(self.image_list)
 
         self.filename = None
         valid_files = []
         for file in image_files:
-            if file in self.image_list or not file.lower().endswith(
+            if file in existing_files or not file.lower().endswith(
                 tuple(extensions)
             ):
                 continue
@@ -6209,6 +6335,8 @@ class LabelingWidget(LabelDialog):
             item = self._create_file_list_item(file, label_file)
             self.file_list_widget.addItem(item)
             self.fn_to_index[file] = self.file_list_widget.count() - 1
+            self._image_files_cache.append(file)
+            existing_files.add(file)
 
         if len(self.image_list) > 1:
             self.actions.open_next_image.setEnabled(True)
@@ -6229,55 +6357,105 @@ class LabelingWidget(LabelDialog):
         if self.compare_view_manager.is_active():
             self.close_compare_view(confirm=False)
 
+        self._stop_folder_scan_if_running()
+        self._import_batch_timer.stop()
+
         self.last_open_dir = dirpath
         self.filename = None
         self.file_list_widget.clear()
-        image_files = []
+        self.fn_to_index.clear()
+        self._image_files_cache = []
+        self._pending_import_files = []
+        self._pending_import_index = 0
+        self._pending_import_load = load
 
-        search_pattern = parse_search_pattern(pattern) if pattern else None
+        self.actions.open_next_image.setEnabled(False)
+        self.actions.open_prev_image.setEnabled(False)
+        self.actions.open_next_unchecked_image.setEnabled(False)
+        self.actions.open_prev_unchecked_image.setEnabled(False)
+        self.statusBar().showMessage(self.tr("Scanning image folder..."))
+        self.statusBar().show()
 
-        for file_index, filename in enumerate(
-            utils.scan_all_images(dirpath), start=1
-        ):
-            if search_pattern:
-                if search_pattern.mode == "index":
-                    if search_pattern.index != file_index:
-                        continue
-                else:
-                    if not matches_filename(filename, search_pattern):
-                        continue
+        self._folder_scan_thread = ImageFolderScanThread(
+            dirpath=dirpath,
+            pattern=pattern,
+            output_dir=self.output_dir,
+            parent=self,
+        )
+        self._folder_scan_thread.scan_finished.connect(
+            self._on_folder_scan_finished
+        )
+        self._folder_scan_thread.scan_failed.connect(self._on_folder_scan_failed)
+        self._folder_scan_thread.finished.connect(self._on_folder_scan_thread_done)
+        self._folder_scan_thread.start()
 
-                    if search_pattern.mode == "attribute":
-                        label_file = osp.splitext(filename)[0] + ".json"
-                        if self.output_dir:
-                            label_file_without_path = osp.basename(label_file)
-                            label_file = (
-                                self.output_dir + "/" + label_file_without_path
-                            )
+    def _stop_folder_scan_if_running(self):
+        if self._folder_scan_thread and self._folder_scan_thread.isRunning():
+            self._folder_scan_thread.requestInterruption()
+            self._folder_scan_thread.wait(2000)
 
-                        if not matches_label_attribute(
-                            filename, label_file, search_pattern
-                        ):
-                            continue
+    def _on_folder_scan_finished(self, image_files):
+        self._pending_import_files = image_files or []
+        self._pending_import_index = 0
+        self._import_batch_timer.start()
 
-            image_files.append(filename)
-            label_file = osp.splitext(filename)[0] + ".json"
-            if self.output_dir:
-                label_file_without_path = osp.basename(label_file)
-                label_file = self.output_dir + "/" + label_file_without_path
-            item = self._create_file_list_item(filename, label_file)
-            self.file_list_widget.addItem(item)
-            self.fn_to_index[filename] = self.file_list_widget.count() - 1
+    def _on_folder_scan_failed(self, error_message):
+        logger.error(f"Failed to scan image folder: {error_message}")
+        self._pending_import_files = []
+        self._pending_import_index = 0
+        self.statusBar().showMessage(
+            self.tr("Failed to scan folder: %s") % error_message
+        )
 
-        self.actions.open_next_image.setEnabled(True)
-        self.actions.open_prev_image.setEnabled(True)
-        self.actions.open_next_unchecked_image.setEnabled(True)
-        self.actions.open_prev_unchecked_image.setEnabled(True)
-        self.toggle_actions(True)
-        self.open_next_image(load=load)
+    def _on_folder_scan_thread_done(self):
+        self._folder_scan_thread = None
 
-        if image_files and self._config.get("exif_scan_enabled", True):
-            self.async_exif_scanner.start_scan(image_files)
+    def _append_import_batch(self):
+        total = len(self._pending_import_files)
+        if self._pending_import_index >= total:
+            self._import_batch_timer.stop()
+            self._finalize_import_image_folder()
+            return
+
+        start = self._pending_import_index
+        end = min(start + self._import_batch_size, total)
+
+        self.file_list_widget.setUpdatesEnabled(False)
+        try:
+            for filename in self._pending_import_files[start:end]:
+                label_file = osp.splitext(filename)[0] + ".json"
+                if self.output_dir:
+                    label_file_without_path = osp.basename(label_file)
+                    label_file = self.output_dir + "/" + label_file_without_path
+                item = self._create_file_list_item(filename, label_file)
+                self.file_list_widget.addItem(item)
+                self.fn_to_index[filename] = self.file_list_widget.count() - 1
+                self._image_files_cache.append(filename)
+        finally:
+            self.file_list_widget.setUpdatesEnabled(True)
+
+        self._pending_import_index = end
+        self.statusBar().showMessage(
+            self.tr("Loading file list... %d/%d") % (end, total)
+        )
+
+    def _finalize_import_image_folder(self):
+        has_images = bool(self._image_files_cache)
+        self.actions.open_next_image.setEnabled(has_images)
+        self.actions.open_prev_image.setEnabled(has_images)
+        self.actions.open_next_unchecked_image.setEnabled(has_images)
+        self.actions.open_prev_unchecked_image.setEnabled(has_images)
+
+        if has_images:
+            self.toggle_actions(True)
+            self.open_next_image(load=self._pending_import_load)
+            if self._config.get("exif_scan_enabled", True):
+                self.async_exif_scanner.start_scan(self._image_files_cache)
+            self.statusBar().showMessage(
+                self.tr("Loaded %d images") % len(self._image_files_cache)
+            )
+        else:
+            self.statusBar().showMessage(self.tr("No images found"))
 
     def toggle_auto_labeling_widget(self):
         """Toggle auto labeling widget visibility."""

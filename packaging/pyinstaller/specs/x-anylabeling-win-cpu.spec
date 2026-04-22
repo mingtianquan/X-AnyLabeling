@@ -157,6 +157,7 @@ a = Analysis(
         (_p('anylabeling', 'services', 'auto_training', 'ultralytics', 'export_yolo_to_ncnn.py'), 'anylabeling/services/auto_training/ultralytics'),
         (_p('anylabeling', 'services', 'auto_training', 'crnn', 'labeling.py'), 'anylabeling/services/auto_training/crnn'),
         (_p('anylabeling', 'services', 'auto_training', 'crnn', 'train_dynamic.py'), 'anylabeling/services/auto_training/crnn'),
+        (_p('anylabeling', 'services', 'auto_training', 'crnn', 'export_dynamic.py'), 'anylabeling/services/auto_training/crnn'),
         (_p('anylabeling', 'services', 'auto_labeling', 'configs', 'bert', '*'), 'anylabeling/services/auto_labeling/configs/bert'),
         (_p('anylabeling', 'services', 'auto_labeling', 'configs', 'clip', '*'), 'anylabeling/services/auto_labeling/configs/clip'),
         (_p('anylabeling', 'services', 'auto_labeling', 'configs', 'ppocr', '*'), 'anylabeling/services/auto_labeling/configs/ppocr'),
